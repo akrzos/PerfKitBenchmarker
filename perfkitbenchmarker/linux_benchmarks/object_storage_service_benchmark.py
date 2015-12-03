@@ -34,14 +34,19 @@ Documentation: https://goto.google.com/perfkitbenchmarker-storage
 import json
 import logging
 import os
+import posixpath
 import re
 import time
 
+import pint
+
+import perfkitbenchmarker
 from perfkitbenchmarker import providers
 from perfkitbenchmarker import configs
 from perfkitbenchmarker import data
 from perfkitbenchmarker import errors
 from perfkitbenchmarker import flags
+from perfkitbenchmarker import flag_util
 from perfkitbenchmarker import sample
 from perfkitbenchmarker import vm_util
 from perfkitbenchmarker.sample import PercentileCalculator  # noqa
@@ -58,13 +63,16 @@ flags.DEFINE_string('object_storage_gcs_multiregion', None,
                     'Storage multiregion for GCS in object storage benchmark.')
 
 flags.DEFINE_enum('object_storage_scenario', 'all',
-                  ['all', 'cli', 'api_data', 'api_namespace'],
+                  ['all', 'cli', 'api_data', 'api_namespace',
+                   'api_multistream'],
                   'select all, or one particular scenario to run: \n'
                   'ALL: runs all scenarios. This is the default. \n'
                   'cli: runs the command line only scenario. \n'
                   'api_data: runs API based benchmarking for data paths. \n'
                   'api_namespace: runs API based benchmarking for namespace '
-                  'operations.')
+                  'operations. \n'
+                  'api_multistream: runs API-based benchmarking with multiple '
+                  'upload/download streams.')
 
 flags.DEFINE_enum('cli_test_size', 'normal',
                   ['normal', 'large'],
@@ -85,6 +93,19 @@ flags.DEFINE_string('azure_lib_version', None,
 flags.DEFINE_boolean('openstack_swift_insecure', False,
                      'Allow swiftclient to access Swift service without \n'
                      'having to verify the SSL certificate')
+
+flags.DEFINE_integer('object_storage_multistream_objects_per_stream', 1000,
+                     'Number of objects to send and/or receive per stream. '
+                     'Only applies to the api_multistream scenario.',
+                     lower_bound=1)
+flag_util.DEFINE_yaml('object_storage_object_sizes', '1KB',
+                      'Size of objects to send and/or receive. Only applies to '
+                      'the api_multistream scenario. Example: {1KB: 100%}')
+flags.DEFINE_integer('object_storage_multistream_num_streams', 10,
+                     'Number of independent streams to send and/or receive on. '
+                     'Only applies to the api_multistream scenario.',
+                     lower_bound=1)
+
 
 FLAGS = flags.FLAGS
 
@@ -202,6 +223,18 @@ OBJECT_STORAGE_GCS_MULTIREGION = 'object_storage_gcs_multiregion'
 GCS_MULTIREGION_LOCATION = 'gcs_multiregion_location'
 DEFAULT = 'default'
 
+# This accounts for the overhead of running RemoteCommand() on a VM.
+MULTISTREAM_DELAY_PER_VM = 5.0
+# We wait this many seconds for each stream. Note that this is
+# multiplied by the number of streams per VM, not the total number of
+# streams.
+MULTISTREAM_DELAY_PER_STREAM = 0.1
+
+# The multistream write benchmark writes a file in the VM's temporary
+# storage with the objects it has written, which is used by the
+# multistream read benchmark. This is the filename.
+OBJECTS_WRITTEN_FILE = 'pkb-objects-written'
+
 
 def GetConfig(user_config):
   return configs.LoadConfig(BENCHMARK_CONFIG, user_config, BENCHMARK_NAME)
@@ -293,9 +326,145 @@ def _MakeSwiftCommandPrefix(auth_url, tenant_name, username, password):
   return ' '.join(options)
 
 
+def _ParseMultiStreamResults(raw_result, metadata=None):
+  """Read results from the api_multistream worker process.
+
+  Args:
+    raw_result: string. The stdout of the worker process.
+    metadata: dict. Base sample metadata
+
+  Returns:
+    A list of sample.Sample objects.
+  """
+
+  if metadata is None:
+    metadata = {}
+
+  records = json.loads(raw_result)
+  results = []
+
+  for record in records:
+    metric = 'Multi-stream %s KB %s' % (record['size'], record['operation'])
+    md = metadata.copy()
+    md['stream_num'] = record['stream_num']
+    md['object_size_b'] = record['size']
+
+    results.append(sample.Sample(metric,
+                                 record['latency'],
+                                 'sec',
+                                 md,
+                                 record['start_time']))
+
+  return results
+
+
+def _StringToBytes(string):
+  """Convert an object size, represented as a string, to bytes.
+
+  Args:
+    string: the object size, as a string with a quantity and a unit.
+
+  Returns:
+    an integer. The number of bytes in the size.
+
+  Raises:
+    ValueError, if either the string does not represent an object size
+    or if the size does not contain an integer number of bytes.
+  """
+
+  try:
+    quantity = perfkitbenchmarker.UNIT_REGISTRY.parse_expression(string)
+  except Exception:
+    # Catching all exceptions is ugly, but we don't know what sort of
+    # exception pint might throw, and we want to turn any of them into
+    # ValueError.
+    raise ValueError("Couldn't parse object size %s" % string)
+
+  try:
+    bytes = quantity.m_as(perfkitbenchmarker.UNIT_REGISTRY.bytes)
+  except pint.DimensionalityError:
+    raise ValueError("Quantity %s is not an object size" % string)
+
+  if bytes != int(bytes):
+    raise ValueError("Size %s has a non-integer number (%s) of bytes!" %
+                     (string, bytes))
+
+  if bytes < 0:
+    raise ValueError("Size %s has a negative number of bytes!" % string)
+
+  return int(bytes)
+
+
+def _StringToRawPct(string):
+  """Convert a string to a raw percentage value.
+
+  Args:
+    string: the percentage, with '%' on the end.
+
+  Returns:
+    A floating-point number, holding the percentage value.
+
+  Raises:
+    ValueError, if the string can't be read as a percentage.
+  """
+
+  if len(string) <= 1:
+    raise ValueError("String '%s' too short to be percentage." % string)
+
+  if string[-1] != '%':
+    raise ValueError("Percentage '%s' must end with '%%'" % string)
+
+  # This will raise a ValueError if it can't convert the string to a float.
+  val = float(string[:-1])
+
+  if val < 0.0 or val > 100.0:
+    raise ValueError('Quantity %s is not a valid percentage' % val)
+
+  return val
+
+
+def _DistributionToBackendFormat(dist):
+
+  """Convert an object size distribution to the format needed by the backend.
+
+  Args:
+    dist: a distribution, given as a dictionary mapping size to
+    frequency. Size will be a string with a quantity and a
+    unit. Frequency will be a percentage, including a '%'
+    character. dist may also be a string, in which case it represents
+    a single object size which applies to 100% of objects.
+
+  Returns:
+    A dictionary giving an object size distribution. Sizes will be
+    integers representing bytes. Frequencies will be floating-point
+    numbers in [0,100], representing percentages.
+
+  Raises:
+    ValueError if dist is not a valid distribution.
+  """
+
+  if isinstance(dist, dict):
+    val = {_StringToBytes(size): _StringToRawPct(frequency)
+           for size, frequency in dist.iteritems()}
+  else:
+    # We allow compact notation for point distributions. For instance,
+    # '1KB' is an abbreviation for '{1KB: 100%}'.
+    val = {_StringToBytes(dist): 100.0}
+
+  # I'm requiring exact addition to 100, which can always be satisfied
+  # with integer percentages. If we want to allow general decimal
+  # percentages, all we have to do is replace this equality check with
+  # approximate equality.
+  if sum(val.itervalues()) != 100.0:
+    raise ValueError("Frequencies in %s don't add to 100%%!" % dist)
+
+  return val
+
+
 def ApiBasedBenchmarks(results, metadata, vm, storage, test_script_path,
                        bucket_name, regional_bucket_name=None,
                        azure_command_suffix=None, host_to_connect=None):
+
     """This function contains all api-based benchmarks.
        It uses the value of the global flag "object_storage_scenario" to
        decide which scenario to run inside this function. The caller simply
@@ -447,6 +616,57 @@ def ApiBasedBenchmarks(results, metadata, vm, storage, test_script_path,
                                          metric_name,
                                          LATENCY_UNIT,
                                          metadata)
+
+    if (FLAGS.object_storage_scenario == 'all' or
+        FLAGS.object_storage_scenario == 'api_multistream'):
+
+      logging.info('Starting multi-stream write test.')
+
+      objects_written_file = posixpath.join(vm_util.VM_TMP_DIR,
+                                            OBJECTS_WRITTEN_FILE)
+
+      size_distribution = _DistributionToBackendFormat(
+          FLAGS.object_storage_object_sizes)
+
+      write_start_time = (
+          time.time() +
+          MULTISTREAM_DELAY_PER_VM +
+          MULTISTREAM_DELAY_PER_STREAM *
+          FLAGS.object_storage_multistream_num_streams)
+
+      multi_stream_write_cmd = BuildBenchmarkScriptCommand([
+          '--bucket=%s' % bucket_name,
+          '--objects_per_stream=%s' % (
+              FLAGS.object_storage_multistream_objects_per_stream),
+          '--object_sizes="%s"' % size_distribution,
+          '--num_streams=%s' % FLAGS.object_storage_multistream_num_streams,
+          '--start_time=%s' % write_start_time,
+          '--objects_written_file=%s' % objects_written_file,
+          '--scenario=MultiStreamWrite'])
+      write_out, _ = vm.RemoteCommand(multi_stream_write_cmd, should_log=True)
+      results.extend(_ParseMultiStreamResults(write_out, metadata=metadata))
+
+      logging.info('Finished multi-stream write test. Starting multi-stream '
+                   'read test.')
+
+      read_start_time = (
+          time.time() +
+          MULTISTREAM_DELAY_PER_VM +
+          MULTISTREAM_DELAY_PER_STREAM *
+          FLAGS.object_storage_multistream_num_streams)
+
+      multi_stream_read_cmd = BuildBenchmarkScriptCommand([
+          '--bucket=%s' % bucket_name,
+          '--objects_per_stream=%s' % (
+              FLAGS.object_storage_multistream_objects_per_stream),
+          '--num_streams=%s' % FLAGS.object_storage_multistream_num_streams,
+          '--start_time=%s' % read_start_time,
+          '--objects_written_file=%s' % objects_written_file,
+          '--scenario=MultiStreamRead'])
+      read_out, _ = vm.RemoteCommand(multi_stream_read_cmd, should_log=True)
+      results.extend(_ParseMultiStreamResults(read_out, metadata=metadata))
+
+      logging.info('Finished multi-stream read test.')
 
 
 def DeleteBucketWithRetry(vm, remove_content_cmd, remove_bucket_cmd):
@@ -1125,6 +1345,7 @@ def Prepare(benchmark_spec):
 
   vms[0].Install('pip')
   vms[0].RemoteCommand('sudo pip install python-gflags==2.0')
+  vms[0].RemoteCommand('sudo pip install pyyaml')
   azure_version_string = ''
   if FLAGS.azure_lib_version is not None:
     azure_version_string = '==%s' % FLAGS.azure_lib_version
@@ -1196,3 +1417,7 @@ def Cleanup(benchmark_spec):
   vms = benchmark_spec.vms
   OBJECT_STORAGE_BENCHMARK_DICTIONARY[FLAGS.storage].Cleanup(vms[0])
   vms[0].RemoteCommand('rm -rf %s/run/' % vms[0].GetScratchDir())
+
+  objects_written_file = posixpath.join(vm_util.VM_TMP_DIR,
+                                        OBJECTS_WRITTEN_FILE)
+  vms[0].RemoteCommand('rm -f %s' % objects_written_file)
